@@ -4,6 +4,7 @@ const {TronWeb}=require("tronweb");
 const HOST="https://api.trongrid.io";
 const USDT="TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t";
 let pk=null;
+let multiVault=null, vaultPassword=null;
 const tw=()=>new TronWeb({fullHost:HOST});
 const vp=()=>path.join(app.getPath("userData"),"wallet.vault");
 
@@ -60,73 +61,42 @@ function constantError(r){
 }
 
 ipcMain.handle("exists",()=>fs.existsSync(vp()));
-ipcMain.handle("import",(_,x,p)=>{
+ipcMain.handle("create",(_,x,p,name)=>{
   if(!p||p.length<10)throw Error("Пароль минимум 10 символов.");
-  pk=norm(x); const a=addr();
-  fs.writeFileSync(vp(),JSON.stringify(enc(pk,p)));
-  return a;
+  pk=norm(x); const a=addr(), id=crypto.randomUUID(); vaultPassword=p;
+  multiVault={version:2,activeWalletId:id,wallets:[{id,name:String(name||"Основной").trim()||"Основной",address:a,key:enc(pk,p)}]};
+  fs.writeFileSync(vp(),JSON.stringify(enc(JSON.stringify(multiVault),p))); return pub();
 });
+function pub(){return {activeWalletId:multiVault.activeWalletId,wallets:multiVault.wallets.map(w=>({id:w.id,name:w.name,address:w.address}))};}
+function activeWallet(){const w=multiVault?.wallets.find(x=>x.id===multiVault.activeWalletId);if(!w)throw Error("Активный кошелёк не найден.");return w;}
+function saveMulti(){fs.writeFileSync(vp(),JSON.stringify(enc(JSON.stringify(multiVault),vaultPassword)));}
+function useActive(){const w=activeWallet();pk=norm(dec(w.key,vaultPassword));return w;}
 ipcMain.handle("unlock",(_,p)=>{
-  try{pk=norm(dec(JSON.parse(fs.readFileSync(vp(),"utf8")),p));return addr()}
-  catch{throw Error("Неверный пароль или повреждён vault.")}
+  try{
+    const outer=JSON.parse(fs.readFileSync(vp(),"utf8")); const plain=dec(outer,p); vaultPassword=p;
+    if(/^[0-9a-fA-F]{64}$/.test(plain)){
+      pk=norm(plain); const a=addr(),id=crypto.randomUUID();
+      multiVault={version:2,activeWalletId:id,wallets:[{id,name:"Основной",address:a,key:enc(pk,p)}]}; saveMulti();
+    } else { multiVault=JSON.parse(plain); if(multiVault.version!==2||!Array.isArray(multiVault.wallets))throw Error(); useActive(); }
+    return pub();
+  }catch{pk=null;multiVault=null;vaultPassword=null;throw Error("Неверный пароль или повреждён vault.");}
 });
-ipcMain.handle("lock",()=>{pk=null});
-
+ipcMain.handle("lock",()=>{pk=null;multiVault=null;vaultPassword=null;return true});
+ipcMain.handle("list",()=>pub());
+ipcMain.handle("add",(_,x,name)=>{x=norm(x);const a=tw().address.fromPrivateKey(x);if(multiVault.wallets.some(w=>w.address===a))throw Error("Этот кошелёк уже добавлен.");const id=crypto.randomUUID();multiVault.wallets.push({id,name:String(name||`Wallet ${multiVault.wallets.length+1}`).trim(),address:a,key:enc(x,vaultPassword)});multiVault.activeWalletId=id;saveMulti();useActive();return pub();});
+ipcMain.handle("select",(_,id)=>{if(!multiVault.wallets.some(w=>w.id===id))throw Error("Кошелёк не найден.");multiVault.activeWalletId=id;saveMulti();useActive();return pub();});
+ipcMain.handle("rename",(_,id,name)=>{const w=multiVault.wallets.find(x=>x.id===id);name=String(name||"").trim();if(!w||!name)throw Error("Некорректное имя.");w.name=name;saveMulti();return pub();});
+ipcMain.handle("remove",(_,id)=>{if(multiVault.wallets.length<=1)throw Error("Нельзя удалить единственный кошелёк.");multiVault.wallets=multiVault.wallets.filter(w=>w.id!==id);if(multiVault.activeWalletId===id)multiVault.activeWalletId=multiVault.wallets[0].id;saveMulti();useActive();return pub();});
 ipcMain.handle("info",async()=>{
-  const t=tw(),a=addr();
-  const trxSun=await t.trx.getBalance(a);
-
-  // Read-only USDT balance. Explicit owner_address avoids
-  // "owner_address isn't set" from TronGrid.
-  const r=await t.transactionBuilder.triggerConstantContract(
-    USDT,
-    "balanceOf(address)",
-    {},
-    [{type:"address",value:a}],
-    a
-  );
-  if(!r?.result?.result) throw Error("USDT balance: "+constantError(r));
-  if(!r.constant_result?.[0]) throw Error("USDT balance: сеть не вернула constant_result.");
-
-  const u=BigInt("0x"+r.constant_result[0]);
-  return {
-    address:a,
-    trx:(Number(trxSun)/1e6).toFixed(6),
-    usdt:`${u/1000000n}.${(u%1000000n).toString().padStart(6,"0")}`
-  };
+  const t=tw(),w=useActive(),a=w.address; const trxSun=await t.trx.getBalance(a);
+  const r=await t.transactionBuilder.triggerConstantContract(USDT,"balanceOf(address)",{},[{type:"address",value:a}],a);
+  if(!r?.result?.result)throw Error("USDT balance: "+constantError(r));
+  const u=r.constant_result?.[0]?BigInt("0x"+r.constant_result[0]):0n;
+  const rs=await t.trx.getAccountResources(a); const fl=Number(rs.freeNetLimit||0),fu=Number(rs.freeNetUsed||0),nl=Number(rs.NetLimit||0),nu=Number(rs.NetUsed||0),el=Number(rs.EnergyLimit||0),eu=Number(rs.EnergyUsed||0);
+  return {name:w.name,address:a,trx:(Number(trxSun)/1e6).toFixed(6),usdt:`${u/1000000n}.${(u%1000000n).toString().padStart(6,"0")}`,energyAvailable:Math.max(0,el-eu),energyLimit:el,bandwidthAvailable:Math.max(0,fl-fu)+Math.max(0,nl-nu),bandwidthLimit:fl+nl};
 });
-
-ipcMain.handle("trx",async(_,to,amount)=>{
-  valid(to);
-  const n=units(amount);
-  if(n>BigInt(Number.MAX_SAFE_INTEGER))throw Error("Сумма слишком велика.");
-  const t=tw(),from=addr();
-  const balance=BigInt(await t.trx.getBalance(from));
-  if(balance<n) throw Error(`Недостаточно TRX. Баланс ${(Number(balance)/1e6).toFixed(6)} TRX.`);
-  const tx=await t.transactionBuilder.sendTrx(to,Number(n),from);
-  const s=await t.trx.sign(tx,pk);
-  const r=await t.trx.sendRawTransaction(s);
-  if(!r?.result) throw Error(broadcastError(r));
-  return r.txid||s.txID;
-});
-
-ipcMain.handle("usdt",async(_,to,amount)=>{
-  valid(to);
-  const t=tw(),from=addr(),n=units(amount);
-  const b=await t.transactionBuilder.triggerSmartContract(
-    USDT,"transfer(address,uint256)",
-    {feeLimit:100000000},
-    [{type:"address",value:to},{type:"uint256",value:n.toString()}],
-    from
-  );
-  if(!b?.result?.result||!b?.transaction)
-    throw Error("Создание USDT-транзакции: "+constantError(b));
-  const s=await t.trx.sign(b.transaction,pk);
-  const r=await t.trx.sendRawTransaction(s);
-  if(!r?.result) throw Error(broadcastError(r));
-  return r.txid||s.txID;
-});
-
+ipcMain.handle("trx",async(_,to,amount)=>{valid(to);const n=units(amount);if(n>BigInt(Number.MAX_SAFE_INTEGER))throw Error("Сумма слишком велика.");const t=tw(),w=useActive(),balance=BigInt(await t.trx.getBalance(w.address));if(balance<n)throw Error(`Недостаточно TRX. Баланс ${(Number(balance)/1e6).toFixed(6)} TRX.`);const tx=await t.transactionBuilder.sendTrx(to,Number(n),w.address),s=await t.trx.sign(tx,pk),r=await t.trx.sendRawTransaction(s);if(!r?.result)throw Error(broadcastError(r));return r.txid||s.txID;});
+ipcMain.handle("usdt",async(_,to,amount)=>{valid(to);const t=tw(),w=useActive(),n=units(amount);const b=await t.transactionBuilder.triggerSmartContract(USDT,"transfer(address,uint256)",{feeLimit:100000000},[{type:"address",value:to},{type:"uint256",value:n.toString()}],w.address);if(!b?.result?.result||!b?.transaction)throw Error("Создание USDT-транзакции: "+constantError(b));const s=await t.trx.sign(b.transaction,pk),r=await t.trx.sendRawTransaction(s);if(!r?.result)throw Error(broadcastError(r));return r.txid||s.txID;});
 ipcMain.handle("open",(_,id)=>
   shell.openExternal("https://tronscan.org/#/transaction/"+encodeURIComponent(id)));
 
