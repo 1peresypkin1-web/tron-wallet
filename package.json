@@ -1,0 +1,36 @@
+{
+  "name": "tron-wallet-portable",
+  "version": "0.1.0",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win portable"
+  },
+  "dependencies": {
+    "tronweb": "6.5.1"
+  },
+  "devDependencies": {
+    "electron": "38.1.0",
+    "electron-builder": "26.0.12"
+  },
+  "build": {
+    "appId": "local.tronwallet.portable",
+    "productName": "TRON Wallet",
+    "asar": true,
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "TRON-Wallet-Portable.exe"
+    }
+  }
+}
